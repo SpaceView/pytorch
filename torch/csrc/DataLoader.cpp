@@ -1,4 +1,6 @@
+#ifndef _WIN32
 #include <sys/wait.h>
+#endif
 #include <map>
 #include <set>
 #include <atomic>
