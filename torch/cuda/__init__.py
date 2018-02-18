@@ -91,21 +91,29 @@ of the CUDA driver.""".format(str(torch._C._cuda_getDriverVersion())))
 
 
 def _check_capability():
-    error_str = """
+    incorrect_binary_warn = """
     Found GPU%d %s which requires CUDA_VERSION >= %d for
      optimal performance and fast startup time, but your PyTorch was compiled
      with CUDA_VERSION %d. Please install the correct PyTorch binary
      using instructions from http://pytorch.org
     """
 
+    old_gpu_warn = """
+    Found GPU%d %s which is of cuda capability %d.%d.
+    PyTorch no longer supports this GPU because it is too old.
+    """
+
     CUDA_VERSION = torch._C._cuda_getCompiledVersion()
     for d in range(device_count()):
-        major = get_device_capability(d)[0]
+        capability = get_device_capability(d)
+        major = capability[0]
         name = get_device_name(d)
         if CUDA_VERSION < 8000 and major >= 6:
-            warnings.warn(error_str % (d, name, 8000, CUDA_VERSION))
+            warnings.warn(incorrect_binary_warn % (d, name, 8000, CUDA_VERSION))
         elif CUDA_VERSION < 9000 and major >= 7:
-            warnings.warn(error_str % (d, name, 8000, CUDA_VERSION))
+            warnings.warn(incorrect_binary_warn % (d, name, 9000, CUDA_VERSION))
+        elif capability == (3, 0) or capability == (5, 0) or major < 3:
+            warnings.warn(old_gpu_warn % (d, name, major, capability[1]))
 
 
 def _lazy_call(callable):
@@ -120,6 +128,19 @@ _lazy_call(_check_capability)
 
 class DeferredCudaCallError(Exception):
     pass
+
+
+def init():
+    """Initialize PyTorch's CUDA state.  You may need to call
+    this explicitly if you are interacting with PyTorch via
+    its C API, as Python bindings for CUDA functionality will not
+    be until this initialization takes place.  Ordinary users
+    should not need this, as all of PyTorch's CUDA methods
+    automatically initialize CUDA state on-demand.
+
+    Does nothing if the CUDA state is already initialized.
+    """
+    _lazy_init()
 
 
 def _lazy_init():
@@ -202,10 +223,10 @@ class device(object):
     def __enter__(self):
         if self.idx is -1:
             return
-        _lazy_init()
         self.prev_idx = torch._C._cuda_getDevice()
         if self.prev_idx != self.idx:
             torch._C._cuda_setDevice(self.idx)
+        _lazy_init()
 
     def __exit__(self, *args):
         if self.prev_idx != self.idx:
@@ -276,6 +297,10 @@ def stream(stream):
     Arguments:
         stream (Stream): selected stream. This manager is a no-op if it's
             ``None``.
+
+    .. note:: Streams are per-device, and this function changes the "current
+       stream" only for the currently selected device.  It is illegal to select
+       a stream that belongs to a different device.
     """
     if stream is None:
         yield
@@ -291,7 +316,6 @@ def stream(stream):
 def device_count():
     """Returns the number of GPUs available."""
     if is_available():
-        _lazy_init()
         return torch._C._cuda_getDeviceCount()
     else:
         return 0
@@ -317,6 +341,7 @@ def current_stream():
 
 def current_blas_handle():
     """Returns cublasHandle_t pointer to current cuBLAS handle"""
+    _lazy_init()
     return torch._C._cuda_getCurrentBlasHandle()
 
 
@@ -324,7 +349,8 @@ def empty_cache():
     """Releases all unoccupied cached memory currently held by the caching
     allocator so that those can be used in other GPU application and visible in
     `nvidia-smi`."""
-    return torch._C._cuda_emptyCache()
+    if _initialized:
+        return torch._C._cuda_emptyCache()
 
 
 def _host_allocator():

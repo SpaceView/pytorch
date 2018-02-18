@@ -8,6 +8,7 @@ import torch.cuda
 import tempfile
 import unittest
 import warnings
+import pickle
 from torch.utils.dlpack import from_dlpack, to_dlpack
 from itertools import product, combinations
 from common import TestCase, iter_indices, TEST_NUMPY, run_tests, download_file, skipIfNoLapack, \
@@ -348,16 +349,19 @@ class TestTorch(TestCase):
             "mean", "median", "mode", "norm", "prod",
             "std", "sum", "var", "max", "min"]
 
-        def normfn_attr(t, dim, keepdim=False):
+        def normfn_attr(t, dim, keepdim=False, out=None):
             attr = getattr(torch, "norm")
-            return attr(t, 2, dim, keepdim)
+            return attr(t, 2, dim, keepdim, out=out)
 
         for fn_name in dim_red_fns:
             fn_attr = getattr(torch, fn_name) if fn_name != "norm" else normfn_attr
 
-            def fn(x, dim, keepdim=False):
-                ans = fn_attr(x, dim, keepdim=keepdim)
+            def fn(x, dim, keepdim=False, out=None):
+                ans = fn_attr(x, dim, keepdim=keepdim, out=out)
                 return ans if not isinstance(ans, tuple) else ans[0]
+
+            def fn_tuple(x, dim, keepdim=False, out=None):
+                return fn_attr(x, dim, keepdim=keepdim, out=out)
 
             def test_multidim(x, dim):
                 self.assertEqual(fn(x, dim).unsqueeze(dim), fn(x, dim, keepdim=True))
@@ -382,6 +386,25 @@ class TestTorch(TestCase):
             dims[singleton_dim] = 1
             x = cast(torch.randn(dims))
             test_multidim(x, singleton_dim)
+
+            # check reducing with output kwargs
+            if fn_name in ['median', 'mode', 'max', 'min']:
+                y = cast(torch.randn(5, 3))
+                values = cast(torch.randn(5, 3))
+                indices = cast(torch.zeros(5, 3).long() - 1)
+                fn_tuple(y, 1, keepdim=False, out=(values[:, 1], indices[:, 1]))
+                values_expected, indices_expected = fn_tuple(y, 1, keepdim=False)
+                self.assertEqual(values[:, 1], values_expected,
+                                 '{} values with out= kwarg'.format(fn_name))
+                self.assertEqual(indices[:, 1], indices_expected,
+                                 '{} indices with out= kwarg'.format(fn_name))
+                continue
+
+            x = cast(torch.randn(5, 3))
+            y = cast(torch.randn(5, 3))
+            fn(y, 1, keepdim=False, out=x[:, 1])
+            expected = fn(y, 1, keepdim=False)
+            self.assertEqual(x[:, 1], expected, '{} with out= kwarg'.format(fn_name))
 
     def test_dim_reduction(self):
         self._test_dim_reduction(self, lambda t: t)
@@ -1916,6 +1939,17 @@ class TestTorch(TestCase):
         self.assertEqual(z.size(), (21, SIZE, SIZE))
 
         self.assertRaises(RuntimeError, lambda: torch.cat([]))
+
+    def test_cat_bad_input_sizes(self):
+        x = torch.randn(2, 1)
+        y = torch.randn(2, 1, 1)
+        z = torch.randn(2, 1, 1)
+        self.assertRaises(RuntimeError, lambda: torch.cat([x, y, z]))
+
+        x = torch.randn(2, 1, 2)
+        y = torch.randn(2, 1, 1)
+        z = torch.randn(2, 2, 1)
+        self.assertRaises(RuntimeError, lambda: torch.cat([x, y, z], dim=1))
 
     def test_stack(self):
         x = torch.rand(2, 3, 4)
@@ -3473,6 +3507,24 @@ class TestTorch(TestCase):
             dest2[idx[i]] = dest2[idx[i]] + src[i]
         self.assertEqual(dest, dest2)
 
+    def test_index_select(self):
+        src = torch.randn(3, 4, 5)
+        # Index can be duplicated.
+        idx = torch.LongTensor([2, 1, 0, 1, 2])
+        dest = torch.index_select(src, 0, idx)
+        self.assertEqual(dest.shape, (5, 4, 5))
+        for i in range(idx.size(0)):
+            self.assertEqual(dest[i], src[idx[i]])
+
+        # Check that 'out' is used correctly.
+        out = torch.randn(5 * 4 * 5)
+        dest = torch.index_select(src, 0, idx, out=out.view(5, 4, 5))
+        self.assertEqual(dest.shape, (5, 4, 5))
+        for i in range(idx.size(0)):
+            self.assertEqual(dest[i], src[idx[i]])
+        out.fill_(0.123)
+        self.assertEqual(out, dest.view(-1))  # Must point to the same storage.
+
     def test_take(self):
         def check(src, idx):
             expected = src.contiguous().view(-1).index_select(
@@ -3747,18 +3799,47 @@ class TestTorch(TestCase):
         self.assertEqual(torch.randn(()).expand(()), torch.randn(()))
 
     def test_repeat(self):
-        result = torch.Tensor()
-        tensor = torch.rand(8, 4)
+
+        initial_shape = (8, 4)
+        tensor = torch.rand(*initial_shape)
+
         size = (3, 1, 1)
         torchSize = torch.Size(size)
         target = [3, 8, 4]
         self.assertEqual(tensor.repeat(*size).size(), target, 'Error in repeat')
-        self.assertEqual(tensor.repeat(torchSize).size(), target, 'Error in repeat using LongStorage')
+        self.assertEqual(tensor.repeat(torchSize).size(), target,
+                         'Error in repeat using LongStorage')
         result = tensor.repeat(*size)
         self.assertEqual(result.size(), target, 'Error in repeat using result')
         result = tensor.repeat(torchSize)
         self.assertEqual(result.size(), target, 'Error in repeat using result and LongStorage')
         self.assertEqual(result.mean(0).view(8, 4), tensor, 'Error in repeat (not equal)')
+
+    @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
+    def test_repeat_tile(self):
+
+        initial_shape = (8, 4)
+
+        repeats = ((3, 1, 1),
+                   (3, 3, 3),
+                   (1, 2, 1),
+                   (2, 2, 2, 2))
+
+        def _generate_noncontiguous_input():
+
+            out = np.broadcast_to(np.random.random((1, 4)),
+                                  initial_shape)
+
+            assert not (out.flags.c_contiguous or out.flags.f_contiguous)
+
+            return out
+
+        for repeat in repeats:
+            for tensor in (torch.from_numpy(np.random.random(initial_shape)),
+                           torch.from_numpy(_generate_noncontiguous_input()),):
+
+                self.assertEqual(tensor.repeat(*repeat).numpy(),
+                                 np.tile(tensor.numpy(), repeat))
 
     def test_is_same_size(self):
         t1 = torch.Tensor(3, 4, 9, 10)
@@ -4120,6 +4201,18 @@ class TestTorch(TestCase):
             rootview = c[8]
             self.assertEqual(rootview.data_ptr(), c[0].data_ptr())
 
+    def test_serialization_offset(self):
+        a = torch.randn(5, 5)
+        i = 41
+        with tempfile.TemporaryFile() as f:
+            pickle.dump(i, f)
+            torch.save(a, f)
+            f.seek(0)
+            j = pickle.load(f)
+            b = torch.load(f)
+            self.assertTrue(torch.equal(a, b))
+            self.assertEqual(i, j)
+
     def test_half_tensor(self):
         x = torch.randn(5, 5).float()
         y = torch.randn(5, 5).float()
@@ -4235,6 +4328,10 @@ class TestTorch(TestCase):
         self.assertEqual(type(tensor), torch.FloatTensor)
         self.assertEqual(tensor, torch.FloatTensor([[1.0, 2.0], [3.0, 4.0]]))
 
+        tensor = torch.load(test_file_path, map_location='cpu')
+        self.assertEqual(type(tensor), torch.FloatTensor)
+        self.assertEqual(tensor, torch.FloatTensor([[1.0, 2.0], [3.0, 4.0]]))
+
     def test_from_buffer(self):
         a = bytearray([1, 2, 3, 4])
         self.assertEqual(torch.ByteStorage.from_buffer(a).tolist(), [1, 2, 3, 4])
@@ -4295,6 +4392,19 @@ class TestTorch(TestCase):
         x = torch.DoubleTensor([1e-324, 1e-323, 1e-322, 1e307, 1e308, 1e309])
         x.__repr__()
         str(x),
+
+    def test_sizeof(self):
+        sizeof_empty = torch.randn(0).storage().__sizeof__()
+        sizeof_10 = torch.randn(10).storage().__sizeof__()
+        sizeof_100 = torch.randn(100).storage().__sizeof__()
+        self.assertEqual((sizeof_100 - sizeof_empty) // (sizeof_10 - sizeof_empty), 10)
+        self.assertEqual((sizeof_100 - sizeof_empty) % (sizeof_10 - sizeof_empty), 0)
+
+        sizeof_empty = torch.randn(0).type(torch.ByteTensor).storage().__sizeof__()
+        sizeof_10 = torch.randn(10).type(torch.ByteTensor).storage().__sizeof__()
+        sizeof_100 = torch.randn(100).type(torch.ByteTensor).storage().__sizeof__()
+        self.assertEqual((sizeof_100 - sizeof_empty) // (sizeof_10 - sizeof_empty), 10)
+        self.assertEqual((sizeof_100 - sizeof_empty) % (sizeof_10 - sizeof_empty), 0)
 
     def test_unsqueeze(self):
         x = torch.randn(2, 3, 4)

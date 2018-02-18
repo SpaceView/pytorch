@@ -28,7 +28,19 @@ class L1Loss(_Loss):
     r"""Creates a criterion that measures the mean absolute value of the
     element-wise difference between input `x` and target `y`:
 
-    :math:`{loss}(x, y)  = 1/n \sum |x_i - y_i|`
+    The loss can be described as:
+
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = \left| x_n - y_n \right|,
+
+    where :math:`N` is the batch size. If reduce is ``True``, then:
+
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
 
     `x` and `y` arbitrary shapes with a total of `n` elements each.
 
@@ -92,17 +104,22 @@ class NLLLoss(_WeightedLoss):
     The target that this loss expects is a class index
     `(0 to C-1, where C = number of classes)`
 
-    The loss can be described as::
+    The loss can be described as:
 
-        loss(x, class) = -x[class]
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = - x_{n,y_n} \cdot \mathbb{1}\{y_n \not= \text{ignore_index}\},
 
-    or in the case of the weight argument it is specified as follows::
+    where :math:`N` is the batch size. If reduce is ``True``, then
 
-        loss(x, class) = -weight[class] * x[class]
-
-    or in the case of ignore_index::
-
-        loss(x, class) = class != ignoreIndex ? -weight[class] * x[class] : 0
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \sum_{n=1}^N w_{y_n} l_n \Big/ \sum_{n=1}^N w_{y_n} \cdot
+            \mathbb{1}\{y_n \not= \text{ignore_index}\}, & \text{if}\;
+            \text{size_average} = \text{True},\\
+            \sum_{n=1}^N w_{y_n} l_n,  & \text{if}\;
+            \text{size_average} = \text{False}.
+        \end{cases}
 
     Args:
         weight (Tensor, optional): a manual rescaling weight given to each
@@ -120,9 +137,15 @@ class NLLLoss(_WeightedLoss):
             Default: ``True``
 
     Shape:
-        - Input: :math:`(N, C)` where `C = number of classes`
-        - Target: :math:`(N)` where each value is `0 <= targets[i] <= C-1`
+        - Input: :math:`(N, C)` where `C = number of classes`.
+            In the case of K-dimensional loss where :math:`K >= 2`, then
+            :math:`(N, C, *)` where `*` is `K` extra dimensions.
+        - Target: :math:`(N)` where each value is `0 <= targets[i] <= C-1`.
+            In the case of K-dimensional loss, where :math:`K >= 2`, then
+            :math:`(N, C, *)` where `*` is `K` extra dimensions.
         - Output: scalar. If reduce is ``False``, then :math:`(N)` instead.
+            In the case of K-dimensional loss and reduce is ``False``, then
+            :math:`(N, C, *)`, the same size as the target.
 
     Examples::
 
@@ -208,6 +231,10 @@ class PoissonNLLLoss(_Loss):
             is set to ``False``, the losses are instead summed for each minibatch.
         eps (float, optional): Small value to avoid evaluation of log(0) when
             log_input==``False``. Default: 1e-8
+        reduce (bool, optional): By default, the losses are averaged
+            over observations for each minibatch, or summed, depending on
+            size_average. When reduce is ``False``, returns a loss per batch
+            element instead and ignores size_average. Default: ``True``
 
     Examples::
 
@@ -217,16 +244,17 @@ class PoissonNLLLoss(_Loss):
         >>> output = loss(log_input, target)
         >>> output.backward()
     """
-    def __init__(self, log_input=True, full=False, size_average=True, eps=1e-8):
-        super(PoissonNLLLoss, self).__init__()
+    def __init__(self, log_input=True, full=False, size_average=True, eps=1e-8, reduce=True):
+        super(PoissonNLLLoss, self).__init__(size_average)
         self.log_input = log_input
         self.full = full
-        self.size_average = size_average
         self.eps = eps
+        self.reduce = reduce
 
     def forward(self, log_input, target):
         _assert_no_grad(target)
-        return F.poisson_nll_loss(log_input, target, self.log_input, self.full, self.size_average, self.eps)
+        return F.poisson_nll_loss(log_input, target, self.log_input, self.full,
+                                  self.size_average, self.eps, self.reduce)
 
 
 class KLDivLoss(_Loss):
@@ -245,7 +273,17 @@ class KLDivLoss(_Loss):
 
     The loss can be described as:
 
-    .. math:: loss(x, target) = 1/n \sum(target_i * (log(target_i) - x_i))
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = y_n \odot \left( \log y_n - x_n \right),
+
+    where :math:`N` is the batch size. If reduce is ``True``, then:
+
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
 
     By default, the losses are averaged for each minibatch over observations
     **as well as** over dimensions. However, if the field
@@ -282,9 +320,21 @@ class KLDivLoss(_Loss):
 
 class MSELoss(_Loss):
     r"""Creates a criterion that measures the mean squared error between
-    `n` elements in the input `x` and target `y`:
+    `n` elements in the input `x` and target `y`.
 
-    :math:`{loss}(x, y)  = 1/n \sum |x_i - y_i|^2`
+    The loss can be described as:
+
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = \left( x_n - y_n \right)^2,
+
+    where :math:`N` is the batch size. If reduce is ``True``, then:
+
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
 
     `x` and `y` arbitrary shapes with a total of `n` elements each.
 
@@ -333,14 +383,22 @@ class BCELoss(_WeightedLoss):
     r"""Creates a criterion that measures the Binary Cross Entropy
     between the target and the output:
 
-    .. math:: loss(o, t) = - 1/n \sum_i (t[i] * log(o[i]) + (1 - t[i]) * log(1 - o[i]))
+    The loss can be described as:
 
-    or in the case of the weight argument being specified:
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = - w_n \left[ y_n \cdot \log x_n + (1 - y_n) \cdot \log (1 - x_n) \right],
 
-    .. math:: loss(o, t) = - 1/n \sum_i weight[i] * (t[i] * log(o[i]) + (1 - t[i]) * log(1 - o[i]))
+    where :math:`N` is the batch size. If reduce is ``True``, then
+
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
 
     This is used for measuring the error of a reconstruction in for example
-    an auto-encoder. Note that the targets `t[i]` should be numbers
+    an auto-encoder. Note that the targets `y` should be numbers
     between 0 and 1.
 
     Args:
@@ -378,14 +436,20 @@ class BCEWithLogitsLoss(Module):
     followed by a `BCELoss` as, by combining the operations into one layer,
     we take advantage of the log-sum-exp trick for numerical stability.
 
-    This Binary Cross Entropy between the target and the output logits
-    (no sigmoid applied) is:
+    The loss can be described as:
 
-    .. math:: loss(o, t) = - 1/n \sum_i (t[i] * log(sigmoid(o[i])) + (1 - t[i]) * log(1 - sigmoid(o[i])))
+    .. math::
+        \ell(x, y) = L = \{l_1,\dots,l_N\}^\top, \quad
+        l_n = - w_n \left[ t_n \cdot \log \sigma(x_n)
+        + (1 - t_n) \cdot \log (1 - \sigma(x_n)) \right],
 
-    or in the case of the weight argument being specified:
+    where :math:`N` is the batch size. If reduce is ``True``, then
 
-    .. math:: loss(o, t) = - 1/n \sum_i weight[i] * (t[i] * log(sigmoid(o[i])) + (1 - t[i]) * log(1 - sigmoid(o[i])))
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
 
     This is used for measuring the error of a reconstruction in for example
     an auto-encoder. Note that the targets `t[i]` should be numbers
@@ -432,9 +496,23 @@ class HingeEmbeddingLoss(_Loss):
     dissimilar, e.g. using the L1 pairwise distance as `x`, and is typically
     used for learning nonlinear embeddings or semi-supervised learning::
 
-                         { x_i,                  if y_i ==  1
-        loss(x, y) = 1/n {
-                         { max(0, margin - x_i), if y_i == -1
+    The loss function for :math:`n`-th sample in the mini-batch is:
+
+    .. math::
+        l_n = \begin{cases}
+            x_n, & \text{if}\; y_n = 1,\\
+            \max \{0, \Delta - x_n\}, & \text{if}\; y_n = -1,
+        \end{cases}
+
+    and the total loss functions is
+
+    .. math::
+        \ell(x, y) = \begin{cases}
+            \operatorname{mean}(L), & \text{if}\; \text{size_average} = \text{True},\\
+            \operatorname{sum}(L),  & \text{if}\; \text{size_average} = \text{False}.
+        \end{cases}
+
+    where :math:`L = \{l_1,\dots,l_N\}^\top`.
 
     `x` and `y` can be of arbitrary shapes with a total of `n` elements each.
     The sum operation operates over all the elements.
@@ -467,7 +545,7 @@ class MultiLabelMarginLoss(_Loss):
 
     `y` and `x` must have the same size.
 
-    The criterion only considers the first non zero `y[j]` targets.
+    The criterion only considers the first non-negative `y[j]` targets.
 
     This allows for different samples to have variable amounts of target classes
     """

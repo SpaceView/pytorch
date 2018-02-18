@@ -97,6 +97,10 @@ def medium_2d(t):
     return make_tensor(t, M, M)
 
 
+def medium_2d_expanded(t):
+    return t(1).expand(M, M)
+
+
 def medium_2d_scaled(t, scale=10):
     return make_tensor(t, M, M).mul(scale)
 
@@ -143,6 +147,13 @@ def new_t(*sizes):
         return t(*sizes).copy_(torch.randn(*sizes))
     return tmp
 
+# Content of each tuple:
+# - function name
+# - constructor for the tensor,    signature: fn(tensor_type) -> tensor
+# - constructor for the arguments, signature: fn(tensor_type) -> list
+# - postfix name for the test (must be unique for a given function) (default='')
+# - tensor types to use (default=types)
+# - disable inplace test, if set to True, no inplace test will be done (default=False)
 tests = [
     ('add', small_3d, lambda t: [number(3.14, 3, t)]),
     ('add', small_3d, lambda t: [small_3d_positive(t)], 'tensor'),
@@ -295,9 +306,11 @@ tests = [
     ('topk', small_3d_unique, lambda t: [2, 1, True, True], 'dim_desc_sort'),
     ('trace', medium_2d, lambda t: [],),
     ('tril', medium_2d, lambda t: [],),
+    ('tril', medium_2d_expanded, lambda t: [], 'zero_stride', types, True),
     ('tril', medium_2d, lambda t: [2], 'positive'),
     ('tril', medium_2d, lambda t: [-2], 'negative'),
     ('triu', medium_2d, lambda t: [],),
+    ('triu', medium_2d_expanded, lambda t: [], 'zero_stride', types, True),
     ('triu', medium_2d, lambda t: [2], 'positive'),
     ('triu', medium_2d, lambda t: [-2], 'negative'),
     ('unsqueeze', new_t(2, 3, 4), lambda t: [2],),
@@ -384,18 +397,24 @@ def get_cycles_per_ms():
     return _cycles_per_ms
 
 
-def compare_cpu_gpu(tensor_constructor, arg_constructor, fn, t, precision=1e-5):
+def compare_cpu_gpu(tensor_constructor, arg_constructor, fn, t, precision=1e-5, force_gpu_half=False):
     def tmp(self):
         cpu_tensor = tensor_constructor(t)
-        gpu_tensor = to_gpu(cpu_tensor)
+        type_map = {}
+        if force_gpu_half:
+            type_map = {
+                'torch.FloatTensor': 'torch.cuda.HalfTensor',
+                'torch.DoubleTensor': 'torch.cuda.HalfTensor',
+            }
+        gpu_tensor = to_gpu(cpu_tensor, type_map)
         cpu_args = arg_constructor(t)
-        gpu_args = [to_gpu(arg) for arg in cpu_args]
+        gpu_args = [to_gpu(arg, type_map) for arg in cpu_args]
         cpu_result = getattr(cpu_tensor, fn)(*cpu_args)
         try:
             gpu_result = getattr(gpu_tensor, fn)(*gpu_args)
         except RuntimeError as e:
             reason = e.args[0]
-            if 'unimplemented data type' in reason:
+            if 'only supports floating-point types' in reason or 'unimplemented data type' in reason:
                 raise unittest.SkipTest('unimplemented data type')
             raise
         except AttributeError as e:
@@ -712,6 +731,38 @@ class TestCuda(TestCase):
         y = torch.randn(4, 4).cuda(1)
         z = torch.cat([x, y], 0)
         self.assertEqual(z.get_device(), x.get_device())
+
+    def test_cat(self):
+        SIZE = 10
+        for dim in range(-3, 3):
+            pos_dim = dim if dim >= 0 else 3 + dim
+            x = torch.rand(13, SIZE, SIZE).transpose(0, pos_dim).cuda()
+            y = torch.rand(17, SIZE, SIZE).transpose(0, pos_dim).cuda()
+            z = torch.rand(19, SIZE, SIZE).transpose(0, pos_dim).cuda()
+
+            res1 = torch.cat((x, y, z), dim)
+            self.assertEqual(res1.narrow(pos_dim, 0, 13), x, 0)
+            self.assertEqual(res1.narrow(pos_dim, 13, 17), y, 0)
+            self.assertEqual(res1.narrow(pos_dim, 30, 19), z, 0)
+
+        x = torch.randn(20, SIZE, SIZE).cuda()
+        self.assertEqual(torch.cat(torch.split(x, 7)), x)
+        self.assertEqual(torch.cat(torch.chunk(x, 7)), x)
+
+        y = torch.randn(1, SIZE, SIZE).cuda()
+        z = torch.cat([x, y])
+        self.assertEqual(z.size(), (21, SIZE, SIZE))
+
+    def test_cat_bad_input_sizes(self):
+        x = torch.randn(2, 1).cuda()
+        y = torch.randn(2, 1, 1).cuda()
+        z = torch.randn(2, 1, 1).cuda()
+        self.assertRaises(RuntimeError, lambda: torch.cat([x, y, z]))
+
+        x = torch.randn(2, 1, 2).cuda()
+        y = torch.randn(2, 1, 1).cuda()
+        z = torch.randn(2, 2, 1).cuda()
+        self.assertRaises(RuntimeError, lambda: torch.cat([x, y, z], dim=1))
 
     def test_serialization(self):
         x = torch.randn(4, 4).cuda()
@@ -1068,18 +1119,27 @@ if HAS_CUDA:
         for t in types:
             tensor = t()
             gpu_tensor = get_gpu_type(t)()
+
+            # Default values
+            desc = ''
+            type_subset = types
+            no_inplace = False
             if len(decl) == 3:
                 name, constr, arg_constr = decl
-                desc = ''
             elif len(decl) == 4:
                 name, constr, arg_constr, desc = decl
             elif len(decl) == 5:
                 name, constr, arg_constr, desc, type_subset = decl
-                if t not in type_subset:
-                    continue
+            elif len(decl) == 6:
+                name, constr, arg_constr, desc, type_subset, no_inplace = decl
+
+            if t not in type_subset:
+                continue
 
             precision = custom_precision.get(name, TestCuda.precision)
             for inplace in (True, False):
+                if inplace and no_inplace:
+                    continue
                 if inplace:
                     name_inner = name + '_'
                 else:
@@ -1096,7 +1156,15 @@ if HAS_CUDA:
                     test_name += '_' + desc
 
                 assert not hasattr(TestCuda, test_name), "Duplicated test name: " + test_name
-                setattr(TestCuda, test_name, compare_cpu_gpu(constr, arg_constr, name_inner, t, precision))
+                setattr(TestCuda,
+                        test_name,
+                        compare_cpu_gpu(constr, arg_constr, name_inner, t, precision))
+                if t == torch.FloatTensor:
+                    assert not hasattr(TestCuda, test_name + '_gpu_half'), "Duplicated test name: " + test_name
+                    setattr(TestCuda,
+                            test_name + '_gpu_half',
+                            compare_cpu_gpu(constr, arg_constr, name_inner, t,
+                                            precision, force_gpu_half=True))
 
 
 if __name__ == '__main__':

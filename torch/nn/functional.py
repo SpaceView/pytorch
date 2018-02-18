@@ -31,11 +31,11 @@ def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1,
         weight: filters of shape (out_channels x in_channels x kW)
         bias: optional bias of shape (out_channels). Default: None
         stride: the stride of the convolving kernel. Can be a single number or
-          a tuple (sW,). Default: 1
+          a one-element tuple (sW,). Default: 1
         padding: implicit zero paddings on both sides of the input. Can be a
-          single number or a tuple (padW,). Default: 0
+          single number or a one-element tuple (padW,). Default: 0
         dilation: the spacing between kernel elements. Can be a single number or
-          a tuple (dW,). Default: 1
+          a one-element tuple (dW,). Default: 1
         groups: split input into groups, in_channels should be divisible by
           the number of groups. Default: 1
 
@@ -340,7 +340,7 @@ def max_pool3d(input, kernel_size, stride=None, padding=0, dilation=1,
     """Applies a 3D max pooling over an input signal composed of several input
     planes.
 
-    See :class:`~torch.nn.MaxPool2d` for details.
+    See :class:`~torch.nn.MaxPool3d` for details.
     """
     ret = _functions.thnn.MaxPool3d.apply(input, kernel_size, stride, padding, dilation,
                                           ceil_mode)
@@ -1021,9 +1021,12 @@ def nll_loss(input, target, weight=None, size_average=True, ignore_index=-100, r
     See :class:`~torch.nn.NLLLoss` for details.
 
     Args:
-        input: :math:`(N, C)` where `C = number of classes` or `(N, C, H, W)`
-            in case of 2D - Loss
-        target: :math:`(N)` where each value is `0 <= targets[i] <= C-1`
+        input: :math:`(N, C)` where `C = number of classes` or :math:`(N, C, H, W)`
+            in case of 2D Loss, or :math:`(N, C, d_1, d_2, ..., d_K)` where :math:`K > 1`
+            in the case of K-dimensional loss.
+        target: :math:`(N)` where each value is `0 <= targets[i] <= C-1`,
+            or :math:`(N, C, d_1, d_2, ..., d_K)` where :math:`K >= 1` for
+            K-dimensional loss.
         weight (Tensor, optional): a manual rescaling weight given to each
             class. If given, has to be a Tensor of size `C`
         size_average (bool, optional): By default, the losses are averaged
@@ -1049,11 +1052,24 @@ def nll_loss(input, target, weight=None, size_average=True, ignore_index=-100, r
         return torch._C._nn.nll_loss(input, target, weight, size_average, ignore_index, reduce)
     elif dim == 4:
         return torch._C._nn.nll_loss2d(input, target, weight, size_average, ignore_index, reduce)
+    elif dim == 3 or dim > 4:
+        n = input.size(0)
+        c = input.size(1)
+        out_size = (n,) + input.size()[2:]
+        if target.size()[1:] != input.size()[2:]:
+            raise ValueError('Expected target size {}, got {}'.format(
+                out_size, input.size()))
+        input = input.contiguous().view(n, c, 1, -1)
+        target = target.contiguous().view(n, 1, -1)
+        if reduce:
+            return torch._C._nn.nll_loss2d(input, target, weight, size_average, ignore_index, reduce)
+        out = torch._C._nn.nll_loss2d(input, target, weight, size_average, ignore_index, reduce)
+        return out.view(out_size)
     else:
-        raise ValueError('Expected 2 or 4 dimensions (got {})'.format(dim))
+        raise ValueError('Expected 2 or more dimensions (got {})'.format(dim))
 
 
-def poisson_nll_loss(input, target, log_input=True, full=False, size_average=True, eps=1e-8):
+def poisson_nll_loss(input, target, log_input=True, full=False, size_average=True, eps=1e-8, reduce=True):
     r"""Poisson negative log likelihood loss.
 
     See :class:`~torch.nn.PoissonNLLLoss` for details.
@@ -1072,6 +1088,10 @@ def poisson_nll_loss(input, target, log_input=True, full=False, size_average=Tru
             the losses are instead summed for each minibatch. Default: ``True``
         eps (float, optional): Small value to avoid evaluation of log(0) when
             log_input=False. Default: 1e-8
+        reduce (bool, optional): By default, the losses are averaged
+            over observations for each minibatch, or summed, depending on
+            size_average. When reduce is ``False``, returns a loss per batch
+            element instead and ignores size_average. Default: ``True``
     """
     if log_input:
         loss = torch.exp(input) - target * input
@@ -1080,10 +1100,11 @@ def poisson_nll_loss(input, target, log_input=True, full=False, size_average=Tru
     if full:
         mask = target > 1
         loss[mask] += (target * torch.log(target) - target + 0.5 * torch.log(2 * math.pi * target))[mask]
+    if not reduce:
+        return loss
     if size_average:
         return torch.mean(loss)
-    else:
-        return torch.sum(loss)
+    return torch.sum(loss)
 
 
 kl_div = _add_docstr(torch._C._nn.kl_div, r"""
@@ -1217,6 +1238,16 @@ def binary_cross_entropy_with_logits(input, target, weight=None, size_average=Tr
         return loss.sum()
 
 
+def _pointwise_loss(lambd, lambd_optimized, input, target, size_average=True, reduce=True):
+    if target.requires_grad:
+        d = lambd(input, target)
+        if not reduce:
+            return d
+        return torch.mean(d) if size_average else torch.sum(d)
+    else:
+        return lambd_optimized(input, target, size_average, reduce)
+
+
 smooth_l1_loss = _add_docstr(torch._C._nn.smooth_l1_loss, r"""
 smooth_l1_loss(input, target, size_average=True) -> Variable
 
@@ -1226,21 +1257,29 @@ element-wise error falls below 1 and an L1 term otherwise.
 See :class:`~torch.nn.SmoothL1Loss` for details.
 """)
 
-l1_loss = _add_docstr(torch._C._nn.l1_loss, r"""
-l1_loss(input, target, size_average=True, reduce=True) -> Variable
 
-Function that takes the mean element-wise absolute value difference.
+def l1_loss(input, target, size_average=True, reduce=True):
+    """
+    l1_loss(input, target, size_average=True, reduce=True) -> Variable
 
-See :class:`~torch.nn.L1Loss` for details.
-""")
+    Function that takes the mean element-wise absolute value difference.
 
-mse_loss = _add_docstr(torch._C._nn.mse_loss, r"""
-mse_loss(input, target, size_average=True, reduce=True) -> Variable
+    See :class:`~torch.nn.L1Loss` for details.
+    """
+    return _pointwise_loss(lambda a, b: torch.abs(a - b), torch._C._nn.l1_loss,
+                           input, target, size_average, reduce)
 
-Measures the element-wise mean squared error.
 
-See :class:`~torch.nn.MSELoss` for details.
-""")
+def mse_loss(input, target, size_average=True, reduce=True):
+    """
+    mse_loss(input, target, size_average=True, reduce=True) -> Variable
+
+    Measures the element-wise mean squared error.
+
+    See :class:`~torch.nn.MSELoss` for details.
+    """
+    return _pointwise_loss(lambda a, b: (a - b) ** 2, torch._C._nn.mse_loss,
+                           input, target, size_average, reduce)
 
 
 def margin_ranking_loss(input1, input2, target, margin=0, size_average=True):
@@ -1600,7 +1639,7 @@ def cosine_similarity(x1, x2, dim=1, eps=1e-8):
     w12 = torch.sum(x1 * x2, dim)
     w1 = torch.norm(x1, 2, dim)
     w2 = torch.norm(x2, 2, dim)
-    return (w12 / (w1 * w2).clamp(min=eps)).squeeze()
+    return w12 / (w1 * w2).clamp(min=eps)
 
 
 def triplet_margin_loss(anchor, positive, negative, margin=1.0, p=2, eps=1e-6, swap=False):
