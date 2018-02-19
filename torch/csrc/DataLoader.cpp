@@ -190,7 +190,7 @@ PyObject *THPModule_removeWorkerPIDs(PyObject *module, PyObject *_ignored) {
     Py_RETURN_NONE;
 }
 
-PyObject *THPModule_exitIfAnyWorkerFails(PyObject *module, PyObject *_ignored) {
+PyObject *THPModule_errorIfAnyWorkerFails(PyObject *module, PyObject *_ignored) {
     Py_RETURN_NONE;
 }
 
