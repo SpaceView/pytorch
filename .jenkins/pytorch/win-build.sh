@@ -146,9 +146,7 @@ if not "%USE_CUDA%"=="0" (
 
   set CUDA_NVCC_EXECUTABLE=%CD%\\tmp_bin\\nvcc
 
-  if "%REBUILD%"=="" (
-     set NO_CUDA=0
-   )
+  if "%REBUILD%"=="" set NO_CUDA=0
 
   python setup.py install && sccache --show-stats && (
     if "%BUILD_ENVIRONMENT%"=="" (
